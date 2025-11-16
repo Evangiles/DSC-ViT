@@ -17,6 +17,8 @@ from pathlib import Path
 
 from models import DSCViT
 from utils import DeepSupervisionLoss, SegmentationMetrics
+from data import get_dataset, VOCSegmentationKaggle
+from data.transforms import SegmentationTransform, get_train_transforms, get_val_transforms
 
 
 class Trainer:
@@ -29,11 +31,14 @@ class Trainer:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Create model
+        # Handle num_clusters (if None, use num_classes)
+        num_clusters = config['model'].get('num_clusters') or config['model']['num_classes']
+
         self.model = DSCViT(
             image_channels=config['model']['image_channels'],
             num_classes=config['model']['num_classes'],
             img_size=config['model']['img_size'],
-            num_clusters=config['model'].get('num_clusters', None),
+            num_clusters=num_clusters,
             latent_dim=config['model']['latent_dim'],
             vit_model_name=config['model']['vit_model_name'],
             use_pretrained_vit=config['model']['use_pretrained_vit'],
@@ -48,7 +53,7 @@ class Trainer:
         # Loss function
         self.criterion = DeepSupervisionLoss(
             num_classes=config['model']['num_classes'],
-            num_clusters=config['model'].get('num_clusters', config['model']['num_classes']),
+            num_clusters=num_clusters,
             lambda_aux=config['loss']['lambda_aux'],
             use_cluster_loss=config['loss']['use_cluster_loss'],
             cluster_loss_alpha=config['loss']['cluster_loss_alpha'],
@@ -200,6 +205,25 @@ class Trainer:
                     loss = loss + cluster_loss
                     loss_dict_total['cluster'] += cluster_loss.item()
 
+                # ACT training loss (TRM paper: train q_head to predict correctness)
+                if self.config['training'].get('use_act', False):
+                    # Compute target: 1 if prediction matches ground truth, 0 otherwise
+                    with torch.no_grad():
+                        y_pred_classes = torch.argmax(seg_pred, dim=1)  # [B, H, W]
+                        # Per-pixel correctness, then average to get confidence score
+                        target_halt = (y_pred_classes == targets).float().mean(dim=[1, 2], keepdim=True)  # [B, 1, 1]
+
+                    # q_logit: [B, 1, H, W] - spatial halt prediction
+                    # Expand target to match q_logit shape
+                    target_halt_expanded = target_halt.unsqueeze(-1).expand_as(q_logit)  # [B, 1, H, W]
+
+                    # Binary cross-entropy: train q_head to predict correctness
+                    act_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                        q_logit, target_halt_expanded
+                    )
+                    loss = loss + act_loss
+                    loss_dict_total['main'] += act_loss.item()
+
                 # Backward pass (for this supervision step only)
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -227,15 +251,15 @@ class Trainer:
                     'step': f'{step+1}/{N_sup}'
                 })
 
-                # ACT early stopping (TRM-style: q_logit > 0)
+                # ACT early stopping (TRM paper: halt if q_logit > 0)
                 if self.config['training'].get('use_act', False):
-                    with torch.no_grad():
-                        # q_logit is [B, 1, H, W], take mean across spatial dims
-                        q_mean = q_logit.mean()
+                    # q_logit is [B, 1, H, W], take mean across batch and spatial dims
+                    q_mean = q_logit.mean().item()
 
-                        # TRM: stop if q_logit > 0 (sigmoid(0) = 0.5 probability)
-                        if q_mean > 0:
-                            break
+                    # TRM paper uses threshold=0: stop if model is confident answer is correct
+                    act_threshold = self.config['training'].get('act_threshold', 0.0)
+                    if q_mean > act_threshold:
+                        break
 
         # Average losses
         total_loss /= total_steps
@@ -354,34 +378,72 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='configs/default.yaml',
                        help='Path to config file')
+    parser.add_argument('--debug', action='store_true',
+                       help='Use small subset for debugging')
     args = parser.parse_args()
 
     # Load config
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
-    # TODO: Load dataset
-    # For now, using placeholder
-    print("WARNING: Using placeholder data loaders. Implement actual dataset loading.")
+    # Create datasets
+    print("\n" + "="*60)
+    print("Loading PASCAL VOC 2012 Dataset")
+    print("="*60)
 
-    # Create placeholder data loaders
-    # Replace this with actual dataset implementation
-    from torch.utils.data import TensorDataset
+    # Training dataset
+    train_transform = SegmentationTransform(
+        get_train_transforms(
+            img_size=config['model']['img_size']
+        )
+    )
+    # Use Kaggle VOC dataset
+    train_dataset = VOCSegmentationKaggle(
+        split='train',
+        transform=train_transform
+    )
 
-    # Dummy data
-    num_samples = 100
-    img_size = config['model']['img_size']
-    num_classes = config['model']['num_classes']
+    # Validation dataset
+    val_transform = SegmentationTransform(
+        get_val_transforms(
+            img_size=config['model']['img_size']
+        )
+    )
+    val_dataset = VOCSegmentationKaggle(
+        split='valid',
+        transform=val_transform
+    )
 
-    train_images = torch.randn(num_samples, 3, img_size, img_size)
-    train_targets = torch.randint(0, num_classes, (num_samples, img_size, img_size))
-    train_dataset = TensorDataset(train_images, train_targets)
-    train_loader = DataLoader(train_dataset, batch_size=config['training']['batch_size'], shuffle=True)
+    print(f"\nDataset loaded:")
+    print(f"  Train: {len(train_dataset)} images ({config['data']['train_split']})")
+    print(f"  Val:   {len(val_dataset)} images ({config['data']['val_split']})")
 
-    val_images = torch.randn(20, 3, img_size, img_size)
-    val_targets = torch.randint(0, num_classes, (20, img_size, img_size))
-    val_dataset = TensorDataset(val_images, val_targets)
-    val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False)
+    # Debug mode: use small subset
+    if args.debug:
+        print("\n⚠️  DEBUG MODE: Using small subset")
+        train_dataset = torch.utils.data.Subset(train_dataset, range(min(100, len(train_dataset))))
+        val_dataset = torch.utils.data.Subset(val_dataset, range(min(20, len(val_dataset))))
+        print(f"  Train: {len(train_dataset)} images")
+        print(f"  Val:   {len(val_dataset)} images")
+
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['training']['batch_size'],
+        shuffle=True,
+        num_workers=config['training']['num_workers'],
+        pin_memory=True
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['training']['batch_size'],
+        shuffle=False,
+        num_workers=config['training']['num_workers'],
+        pin_memory=True
+    )
+
+    print("="*60)
 
     # Create trainer
     trainer = Trainer(config)

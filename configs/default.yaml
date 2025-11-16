@@ -3,7 +3,7 @@
 # Model settings
 model:
   image_channels: 3
-  num_classes: 19  # Cityscapes
+  num_classes: 21  # PASCAL VOC (20 objects + 1 background)
   img_size: 256
   num_clusters: null  # If null, use num_classes
   latent_dim: 512
@@ -53,14 +53,14 @@ training:
 
   # ACT (Adaptive Computational Time) - Early stopping per batch
   use_act: true
-  act_threshold: 0.95  # Stop if accuracy > threshold
+  act_threshold: 0.0  # TRM paper: stop if q_logit > 0 (model predicts answer is correct)
 
 # Data settings
 data:
-  dataset_name: 'cityscapes'
-  data_root: 'data/cityscapes'
-  train_split: 'train'
-  val_split: 'val'
+  dataset_name: 'voc'  # PASCAL VOC 2012
+  data_root: 'data'
+  train_split: 'train'  # 1,464 images (torchvision built-in)
+  val_split: 'val'  # 1,449 images (official VOC val)
 
   # Augmentation (based on TRM paper)
   augmentation:
