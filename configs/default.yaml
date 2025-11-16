@@ -1,0 +1,76 @@
+# Default configuration for DSC-ViT training
+
+# Model settings
+model:
+  image_channels: 3
+  num_classes: 19  # Cityscapes
+  img_size: 256
+  num_clusters: null  # If null, use num_classes
+  latent_dim: 512
+  vit_model_name: 'vit_base_patch16_224'
+  use_pretrained_vit: true
+  use_simple_encoder: false  # Set to true for faster prototyping
+  num_latent_updates: 6  # n: Number of reasoning latent (z) updates (TRM uses 6)
+  num_recursive_steps: 3  # T: Frequency of answer latent (y) updates (TRM uses 3)
+  fusion_method: 'residual'  # Options: 'residual', 'gated', 'attention'
+  freeze_vit: false
+
+# Loss settings
+loss:
+  lambda_aux: 0.4  # Weight for auxiliary deep supervision loss
+  use_cluster_loss: true
+  cluster_loss_alpha: 0.1  # Compactness weight
+  cluster_loss_beta: 0.05  # Separation weight
+
+# Optimizer settings (TRM paper settings)
+optimizer:
+  name: 'adamw'
+  lr: 1.0e-4
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.1
+
+# Scheduler settings
+scheduler:
+  name: 'cosine'
+  min_lr: 1.0e-6
+  step_size: 30
+  gamma: 0.1
+
+# Training settings
+training:
+  epochs: 100
+  batch_size: 8  # Adjust based on GPU memory
+  num_workers: 4
+  num_supervision_steps: 16  # N_sup: Deep supervision steps (TRM uses 16)
+  val_interval: 1  # Validate every N epochs
+  save_interval: 10  # Save checkpoint every N epochs
+  grad_clip: 1.0  # Gradient clipping
+  use_ema: true  # Exponential moving average (TRM uses this)
+  ema_decay: 0.999
+  warmup_epochs: 5
+  exp_dir: 'experiments/default'
+
+  # ACT (Adaptive Computational Time) - Early stopping per batch
+  use_act: true
+  act_threshold: 0.95  # Stop if accuracy > threshold
+
+# Data settings
+data:
+  dataset_name: 'cityscapes'
+  data_root: 'data/cityscapes'
+  train_split: 'train'
+  val_split: 'val'
+
+  # Augmentation (based on TRM paper)
+  augmentation:
+    random_flip: true
+    random_crop: true
+    color_jitter: true
+    dihedral: true  # 8 dihedral transformations
+
+# Cluster temperature annealing (optional)
+cluster_temperature:
+  initial: 1.0
+  final: 0.5
+  schedule: 'linear'  # Options: 'linear', 'exponential', 'cosine'
