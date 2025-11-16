@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+.ipynb_checkpoints/
+
+# Data and experiments
+data/*
+!data/*.py  # Keep Python data loaders
+experiments/
+*.log
+
+# UV (Python package manager)
+uv.lock
+
+# OS
+.DS_Store
+*.pyc
+
+# Temporary files
+*.tmp
+.python-version

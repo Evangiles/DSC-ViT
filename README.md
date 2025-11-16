@@ -2,38 +2,51 @@
 
 PyTorch implementation of DSC-ViT for image segmentation, inspired by the Tiny Recursive Model (TRM) paper.
 
-## Key Innovation
+## Key Innovations
 
-**Cluster Space Integration**: Instead of projecting cluster features to visual space (K→C→K→D), we project the original image directly to cluster space (C→K→D). This:
+### 1. **Cluster Space Integration**
+Instead of projecting cluster features to visual space (K→C→K→D), we project the original image directly to cluster space (C→K→D). This:
 - Reduces computational complexity by 33%
 - Improves interpretability (cluster activations directly visible)
 - Maintains better information flow throughout recursion
+
+### 2. **⭐ ViT Outside Recursive Loop (NEW!)**
+Unlike naive implementations that call ViT n×T times per step, we compute ViT features **once** and cache them:
+- **18x speedup** in recursive refinement (288 → 16 ViT calls for N_sup=16)
+- Enables **frozen ViT** as feature extractor (pre-trained knowledge preserved)
+- **Lightweight modules** (projections, clustering) handle recursive learning
+- True to TRM's philosophy: "tiny recursive network" with ~5M trainable parameters
 
 ## Architecture Overview
 
 ```
 Input Image (H×W×C)
   ↓
-  Project to Cluster Space (C→K) [computed once, cached]
+  ⭐ ViT Encoding (ONCE): image → x_vit [B, D, H', W'] [cached]
   ↓
-  Initialize ViT Input (C→D)
+  ⭐ Project to Cluster (ONCE): image → image_cluster [B, K, H', W'] [cached]
   ↓
   ┌─────────── Deep Supervision Loop (N_sup=16 times) ───────────┐
   │                                                               │
   │  ┌─────────── Recursive Loop (T=3 times) ───────────┐       │
-  │  │                                                   │       │
-  │  │  1. ViT Encoding: (D) latent features           │       │
-  │  │  2. Project to Cluster: D→K                      │       │
-  │  │  3. Soft K-Means Clustering in K-space           │       │
-  │  │  4. Combine with Image (in cluster space!)       │       │
-  │  │  5. Project back to Latent: K→D                  │       │
-  │  │  6. Segmentation Prediction                      │       │
-  │  │                                                   │       │
+  │  │  ┌── Latent Update Loop (n=6 times) ──────┐     │       │
+  │  │  │                                         │     │       │
+  │  │  │  1. Project to Cluster: (y+z) → D→K    │     │       │
+  │  │  │  2. Soft K-Means Clustering in K-space │     │       │
+  │  │  │  3. Combine: z_clustered + image_cluster│    │       │
+  │  │  │  4. Project back: K→D                   │     │       │
+  │  │  │  5. Add ViT residual: z = z + x_vit   │     │       │
+  │  │  │                                         │     │       │
+  │  │  └─────────────────────────────────────────┘     │       │
+  │  │  ↓                                                │       │
+  │  │  Answer Update: y = y + z                        │       │
   │  └───────────────────────────────────────────────────┘       │
+  │  ↓                                                            │
+  │  Segmentation Prediction from y                              │
   │  ↓                                                            │
   │  Loss Computation → Backward → Optimizer Step                │
   │  ↓                                                            │
-  │  z_latent.detach() [gradient isolation]                      │
+  │  y, z = y.detach(), z.detach() [gradient isolation]         │
   │  ↓                                                            │
   │  Early Stop? (ACT) → Yes: break | No: continue               │
   │                                                               │
@@ -92,22 +105,25 @@ Run individual module tests:
 
 ```bash
 # Test projection layers
-python models/projections.py
+python -m models.projections
 
 # Test Soft K-Means
-python models/soft_kmeans.py
+python -m models.soft_kmeans
 
 # Test ViT encoder
-python models/vit_encoder.py
+python -m models.vit_encoder
 
 # Test full DSC-ViT model
-python models/dsc_vit.py
+python -m models.dsc_vit
 
 # Test loss functions
-python utils/losses.py
+python -m utils.losses
 
 # Test metrics
-python utils/metrics.py
+python -m utils.metrics
+
+# ⭐ Benchmark ViT optimization (verify 18x speedup)
+python benchmark_vit_calls.py
 ```
 
 ### 2. Training
