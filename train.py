@@ -71,8 +71,11 @@ class Trainer:
             use_focal_loss=config['loss'].get('use_focal_loss', False),
             focal_alpha=config['loss'].get('focal_alpha', 0.25),
             focal_gamma=config['loss'].get('focal_gamma', 2.0),
-            use_bce=config['loss'].get('use_bce', False),
-            bce_weight=config['loss'].get('bce_weight', 0.5)
+            use_dice=config['loss'].get('use_dice', False),
+            dice_weight=config['loss'].get('dice_weight', 0.5),
+            use_boundary=config['loss'].get('use_boundary', False),
+            boundary_weight=config['loss'].get('boundary_weight', 0.3),
+            boundary_pixel_weight=config['loss'].get('boundary_pixel_weight', 5.0)
         )
 
         # Optimizer
@@ -179,7 +182,8 @@ class Trainer:
         loss_dict_total = {
             'main': 0.0,
             'main_primary': 0.0,
-            'main_bce': 0.0,
+            'main_dice': 0.0,
+            'main_boundary': 0.0,
             'aux': 0.0,
             'cluster': 0.0
         }
@@ -221,7 +225,8 @@ class Trainer:
                 loss, loss_detail = self.criterion.seg_loss(seg_pred, targets, return_dict=True)
                 loss_dict_total['main'] += loss.item()
                 loss_dict_total['main_primary'] += loss_detail['primary']
-                loss_dict_total['main_bce'] += loss_detail['bce']
+                loss_dict_total['main_dice'] += loss_detail['dice']
+                loss_dict_total['main_boundary'] += loss_detail['boundary']
                 # Note: aux is not computed in this training loop structure (using N_sup instead of T-step collection)
 
                 # Cluster space loss (if enabled)
@@ -355,7 +360,7 @@ class Trainer:
             train_loss, train_loss_dict = self.train_epoch(train_loader, epoch)
 
             print(f"Train Loss: {train_loss:.4f}")
-            print(f"  Main: {train_loss_dict['main']:.4f} (Focal/CE: {train_loss_dict['main_primary']:.4f}, BCE: {train_loss_dict['main_bce']:.4f})")
+            print(f"  Main: {train_loss_dict['main']:.4f} (Focal/CE: {train_loss_dict['main_primary']:.4f}, Dice: {train_loss_dict['main_dice']:.4f}, Boundary: {train_loss_dict['main_boundary']:.4f})")
             print(f"  Cluster: {train_loss_dict['cluster']:.4f}")
 
             # Validate

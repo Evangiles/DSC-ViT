@@ -27,9 +27,14 @@ loss:
   focal_alpha: 0.25  # Weighting factor (0.25 for foreground focus)
   focal_gamma: 2.0   # Focusing parameter (2.0 standard, higher = more focus on hard examples)
 
-  # Binary Cross Entropy (multi-label approach)
-  use_bce: true
-  bce_weight: 1.0  # Weight for BCE component (combined with Focal/CE)
+  # Dice Loss (better for class imbalance)
+  use_dice: true
+  dice_weight: 1.0  # Weight for Dice component
+
+  # Boundary Loss (improves edge quality)
+  use_boundary: false
+  boundary_weight: 0.3  # Weight for boundary component
+  boundary_pixel_weight: 5.0  # Pixel weight at boundaries (5x)
 
 # Optimizer settings (TRM paper settings)
 optimizer:

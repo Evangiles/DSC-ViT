@@ -13,58 +13,120 @@ import torch.nn.functional as F
 from typing import List, Optional
 
 
-class BCELoss(nn.Module):
+class DiceLoss(nn.Module):
     """
-    Binary Cross Entropy Loss for multi-label segmentation.
+    Dice Loss for segmentation.
 
-    Treats each class as an independent binary classification problem.
-    Useful when pixels can belong to multiple classes.
+    Dice = 2 * |A ∩ B| / (|A| + |B|)
+
+    Better for handling class imbalance compared to CE.
     """
 
-    def __init__(self, ignore_index: int = -100, pos_weight: Optional[torch.Tensor] = None):
+    def __init__(self, ignore_index: int = -100, smooth: float = 1.0):
         super().__init__()
         self.ignore_index = ignore_index
-        self.pos_weight = pos_weight
+        self.smooth = smooth
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            pred: [B, num_classes, H, W] - logits (before sigmoid)
+            pred: [B, num_classes, H, W] - logits
             target: [B, H, W] - class indices
         Returns:
             loss: scalar
         """
         B, C, H, W = pred.shape
 
-        # Convert target to one-hot encoding
-        # Handle ignore_index by clamping first
+        # Softmax to get probabilities
+        pred_soft = F.softmax(pred, dim=1)  # [B, C, H, W]
+
+        # Convert target to one-hot
         target_clamped = target.clamp(0, C - 1)
         target_one_hot = F.one_hot(target_clamped, num_classes=C)  # [B, H, W, C]
         target_one_hot = target_one_hot.permute(0, 3, 1, 2).float()  # [B, C, H, W]
 
-        # Apply sigmoid to predictions
-        pred_sigmoid = torch.sigmoid(pred)
+        # Mask out ignore_index
+        valid_mask = (target != self.ignore_index).unsqueeze(1).float()  # [B, 1, H, W]
 
-        # Binary cross entropy
-        if self.pos_weight is not None:
-            bce = F.binary_cross_entropy_with_logits(
-                pred, target_one_hot,
-                pos_weight=self.pos_weight,
-                reduction='none'
-            )
-        else:
-            bce = F.binary_cross_entropy(
-                pred_sigmoid, target_one_hot,
-                reduction='none'
-            )  # [B, C, H, W]
+        # Apply mask
+        pred_soft = pred_soft * valid_mask
+        target_one_hot = target_one_hot * valid_mask
+
+        # Compute dice coefficient per class
+        intersection = (pred_soft * target_one_hot).sum(dim=(2, 3))  # [B, C]
+        union = pred_soft.sum(dim=(2, 3)) + target_one_hot.sum(dim=(2, 3))  # [B, C]
+
+        dice = (2.0 * intersection + self.smooth) / (union + self.smooth)  # [B, C]
+
+        # Average over classes and batch
+        dice_loss = 1.0 - dice.mean()
+
+        return dice_loss
+
+
+class BoundaryLoss(nn.Module):
+    """
+    Boundary Loss - higher weight on boundary pixels.
+
+    Penalizes errors at class boundaries more heavily to improve edge quality.
+    """
+
+    def __init__(self, ignore_index: int = -100, boundary_weight: float = 5.0):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.boundary_weight = boundary_weight
+
+    def find_boundaries(self, target: torch.Tensor) -> torch.Tensor:
+        """
+        Find boundary pixels using morphological gradient.
+
+        Args:
+            target: [B, H, W]
+        Returns:
+            boundaries: [B, H, W] - 1 at boundaries, 0 elsewhere
+        """
+        B, H, W = target.shape
+
+        # Pad target
+        target_padded = F.pad(target.float(), (1, 1, 1, 1), mode='replicate')
+
+        # Compute gradients (differences with neighbors)
+        grad_h = torch.abs(target_padded[:, 1:-1, 1:-1] - target_padded[:, 2:, 1:-1])
+        grad_v = torch.abs(target_padded[:, 1:-1, 1:-1] - target_padded[:, 1:-1, 2:])
+
+        # Boundary if any gradient > 0
+        boundaries = ((grad_h > 0) | (grad_v > 0)).float()
+
+        return boundaries
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred: [B, num_classes, H, W]
+            target: [B, H, W]
+        Returns:
+            loss: scalar
+        """
+        # Compute standard cross entropy
+        ce_loss = F.cross_entropy(
+            pred, target,
+            reduction='none',
+            ignore_index=self.ignore_index
+        )  # [B, H, W]
+
+        # Find boundaries
+        boundaries = self.find_boundaries(target)  # [B, H, W]
+
+        # Weight: 1 + boundary_weight at boundaries
+        weights = 1.0 + self.boundary_weight * boundaries
+
+        # Apply weights
+        weighted_loss = ce_loss * weights
 
         # Mask out ignore_index
-        valid_mask = (target != self.ignore_index).unsqueeze(1)  # [B, 1, H, W]
-        bce = bce * valid_mask.float()
-
-        # Average over valid pixels
+        valid_mask = (target != self.ignore_index)
         if valid_mask.sum() > 0:
-            loss = bce.sum() / valid_mask.sum()
+            loss = weighted_loss[valid_mask].mean()
         else:
             loss = torch.tensor(0.0, device=pred.device)
 
@@ -134,7 +196,7 @@ class FocalLoss(nn.Module):
 
 class SegmentationLoss(nn.Module):
     """
-    Segmentation loss with support for CE, Focal Loss, and BCE.
+    Segmentation loss with support for CE, Focal Loss, Dice Loss, and Boundary Loss.
     """
 
     def __init__(self,
@@ -144,15 +206,20 @@ class SegmentationLoss(nn.Module):
                  use_focal: bool = False,
                  focal_alpha: float = 0.25,
                  focal_gamma: float = 2.0,
-                 use_bce: bool = False,
-                 bce_weight: float = 0.5):
+                 use_dice: bool = False,
+                 dice_weight: float = 0.5,
+                 use_boundary: bool = False,
+                 boundary_weight: float = 0.3,
+                 boundary_pixel_weight: float = 5.0):
         super().__init__()
 
         self.num_classes = num_classes
         self.ignore_index = ignore_index
         self.use_focal = use_focal
-        self.use_bce = use_bce
-        self.bce_weight = bce_weight
+        self.use_dice = use_dice
+        self.dice_weight = dice_weight
+        self.use_boundary = use_boundary
+        self.boundary_weight = boundary_weight
 
         # Primary loss
         if use_focal:
@@ -167,9 +234,16 @@ class SegmentationLoss(nn.Module):
                 ignore_index=ignore_index
             )
 
-        # Optional BCE loss
-        if use_bce:
-            self.bce_loss = BCELoss(ignore_index=ignore_index)
+        # Optional Dice loss
+        if use_dice:
+            self.dice_loss = DiceLoss(ignore_index=ignore_index)
+
+        # Optional Boundary loss
+        if use_boundary:
+            self.boundary_loss = BoundaryLoss(
+                ignore_index=ignore_index,
+                boundary_weight=boundary_pixel_weight
+            )
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor, return_dict: bool = False):
         """
@@ -184,17 +258,25 @@ class SegmentationLoss(nn.Module):
         primary = self.primary_loss(pred, target)
         loss = primary
 
-        # Add BCE if enabled
-        bce_val = 0.0
-        if self.use_bce:
-            bce = self.bce_loss(pred, target)
-            bce_val = bce.item()
-            loss = loss + self.bce_weight * bce
+        # Add Dice if enabled
+        dice_val = 0.0
+        if self.use_dice:
+            dice = self.dice_loss(pred, target)
+            dice_val = dice.item()
+            loss = loss + self.dice_weight * dice
+
+        # Add Boundary if enabled
+        boundary_val = 0.0
+        if self.use_boundary:
+            boundary = self.boundary_loss(pred, target)
+            boundary_val = boundary.item()
+            loss = loss + self.boundary_weight * boundary
 
         if return_dict:
             loss_dict = {
                 'primary': primary.item(),  # Focal or CE
-                'bce': bce_val
+                'dice': dice_val,
+                'boundary': boundary_val
             }
             return loss, loss_dict
 
@@ -377,8 +459,11 @@ class DeepSupervisionLoss(nn.Module):
                  use_focal_loss: bool = False,
                  focal_alpha: float = 0.25,
                  focal_gamma: float = 2.0,
-                 use_bce: bool = False,
-                 bce_weight: float = 0.5):
+                 use_dice: bool = False,
+                 dice_weight: float = 0.5,
+                 use_boundary: bool = False,
+                 boundary_weight: float = 0.3,
+                 boundary_pixel_weight: float = 5.0):
         super().__init__()
 
         self.lambda_aux = lambda_aux
@@ -389,8 +474,11 @@ class DeepSupervisionLoss(nn.Module):
             use_focal=use_focal_loss,
             focal_alpha=focal_alpha,
             focal_gamma=focal_gamma,
-            use_bce=use_bce,
-            bce_weight=bce_weight
+            use_dice=use_dice,
+            dice_weight=dice_weight,
+            use_boundary=use_boundary,
+            boundary_weight=boundary_weight,
+            boundary_pixel_weight=boundary_pixel_weight
         )
 
         # Cluster space loss
@@ -457,8 +545,9 @@ class DeepSupervisionLoss(nn.Module):
         loss_dict = {
             'total': total_loss.item(),
             'main': L_main.item(),
-            'main_primary': main_detail['primary'],  # Focal or CE value
-            'main_bce': main_detail['bce'],           # BCE value
+            'main_primary': main_detail['primary'],    # Focal or CE value
+            'main_dice': main_detail['dice'],          # Dice value
+            'main_boundary': main_detail['boundary'],  # Boundary value
             'aux': L_aux.item(),
             'cluster': L_cluster.item() if self.use_cluster_loss else 0.0,
         }
