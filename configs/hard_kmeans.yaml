@@ -1,35 +1,33 @@
-# Default configuration for DSC-ViT training
+# Configuration for DSC-ViT with Hard K-Means clustering
+#
+# Key differences from default.yaml:
+# 1. clustering_method: 'hard' (EM-based, no gradients)
+# 2. num_clusters: Independent from num_classes (e.g., 50 clusters for 21 classes)
+# 3. No cluster temperature (Hard K-Means doesn't use temperature)
+# 4. Cluster loss disabled (no gradient flow through clustering)
 
 # Model settings
 model:
   image_channels: 3
   num_classes: 21  # PASCAL VOC (20 objects + 1 background)
   img_size: 256
-  num_clusters: null  # If null, use num_classes
+  num_clusters: 2  # ⭐ Binary clustering (foreground/background)
   latent_dim: 512
   vit_model_name: 'vit_base_patch16_224'
   use_pretrained_vit: true
   use_simple_encoder: false  # Set to true for faster prototyping
   num_latent_updates: 6  # n: Number of reasoning latent (z) updates (TRM uses 6)
   num_recursive_steps: 3  # T: Frequency of answer latent (y) updates (TRM uses 3)
-  fusion_method: 'attention'  # Options: 'residual', 'gated', 'attention'
+  fusion_method: 'residual'  # ⭐ Simple residual fusion (no attention overhead)
   freeze_vit: true
+  clustering_method: 'hard'  # ⭐ Hard K-Means (EM-based)
 
 # Loss settings
 loss:
   lambda_aux: 0.4  # Weight for auxiliary deep supervision loss
-  use_cluster_loss: true
-  cluster_loss_alpha: 1.0  # Compactness weight (10x increase for stronger learning)
-  cluster_loss_beta: 0.5  # Separation weight (10x increase for better cluster separation)
-
-  # Focal Loss (addresses class imbalance and hard examples)
-  use_focal_loss: true
-  focal_alpha: 0.25  # Weighting factor (0.25 for foreground focus)
-  focal_gamma: 2.0   # Focusing parameter (2.0 standard, higher = more focus on hard examples)
-
-  # Binary Cross Entropy (multi-label approach)
-  use_bce: true
-  bce_weight: 1.0  # Weight for BCE component (combined with Focal/CE)
+  use_cluster_loss: false  # ⭐ Disabled (no gradient through clustering)
+  cluster_loss_alpha: 0.0  # Not used
+  cluster_loss_beta: 0.0   # Not used
 
 # Optimizer settings (TRM paper settings)
 optimizer:
@@ -49,20 +47,20 @@ scheduler:
 # Training settings
 training:
   epochs: 100
-  batch_size: 32  # Adjust based on GPU memory
+  batch_size: 8  # Adjust based on GPU memory
   num_workers: 8
   num_supervision_steps: 8  # N_sup: Deep supervision steps (TRM uses 16)
   val_interval: 1  # Validate every N epochs
   save_interval: 10  # Save checkpoint every N epochs
-  grad_clip: 0.5  # Gradient clipping
+  grad_clip: 1.0  # Gradient clipping
   use_ema: true  # Exponential moving average (TRM uses this)
   ema_decay: 0.999
   warmup_epochs: 5
-  exp_dir: 'experiments/default'
+  exp_dir: 'experiments/hard_kmeans'
 
   # ACT (Adaptive Computational Time) - Early stopping per batch
-  use_act: true
-  act_threshold: 3.0  # TRM paper: stop if q_logit > 0
+  use_act: false  # Disabled for hard k-means experiments
+  act_threshold: 0.0  # TRM paper: stop if q_logit > 0
 
 # Data settings
 data:
@@ -78,8 +76,4 @@ data:
     color_jitter: true
     dihedral: true  # 8 dihedral transformations
 
-# Cluster temperature annealing (optional)
-cluster_temperature:
-  initial: 2.0  # Start softer for exploration
-  final: 0.1    # End sharper for definitive assignments
-  schedule: 'cosine'  # Smoother annealing (linear → cosine)
+# Note: cluster_temperature section removed (not used for hard k-means)

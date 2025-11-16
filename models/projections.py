@@ -193,13 +193,25 @@ class AttentionFusion(nn.Module):
     More sophisticated than gated fusion, but higher computational cost.
     """
 
-    def __init__(self, num_clusters: int, num_heads: int = 4):
+    def __init__(self, num_clusters: int, num_heads: int = None):
         super().__init__()
+
+        # Auto-select num_heads if not provided (prefer powers of 2)
+        if num_heads is None:
+            # Try powers of 2 first (descending from 16)
+            for h in [16, 8, 4, 2, 1]:
+                if num_clusters % h == 0:
+                    num_heads = h
+                    break
+            if num_heads is None:
+                num_heads = 1
+
+        assert num_clusters % num_heads == 0, f"num_clusters ({num_clusters}) must be divisible by num_heads ({num_heads})"
 
         self.num_heads = num_heads
         self.head_dim = num_clusters // num_heads
 
-        assert num_clusters % num_heads == 0, "num_clusters must be divisible by num_heads"
+        print(f"  AttentionFusion: num_clusters={num_clusters}, num_heads={num_heads}, head_dim={self.head_dim}")
 
         # Q, K, V projections
         self.q_proj = nn.Conv2d(num_clusters, num_clusters, kernel_size=1)
@@ -219,17 +231,17 @@ class AttentionFusion(nn.Module):
         Returns:
             fused: [B, K, H, W]
         """
-        B, K, H, W = z_clustered.shape
+        B, num_clusters, height, width = z_clustered.shape
 
         # Query from z_clustered, Key and Value from image_cluster
-        Q = self.q_proj(z_clustered)  # [B, K, H, W]
+        Q = self.q_proj(z_clustered)  # [B, num_clusters, height, width]
         K = self.k_proj(image_cluster)
         V = self.v_proj(image_cluster)
 
         # Reshape for multi-head attention
-        Q = Q.view(B, self.num_heads, self.head_dim, H * W)  # [B, num_heads, head_dim, HW]
-        K = K.view(B, self.num_heads, self.head_dim, H * W)
-        V = V.view(B, self.num_heads, self.head_dim, H * W)
+        Q = Q.view(B, self.num_heads, self.head_dim, height * width)  # [B, num_heads, head_dim, HW]
+        K = K.view(B, self.num_heads, self.head_dim, height * width)
+        V = V.view(B, self.num_heads, self.head_dim, height * width)
 
         # Attention scores
         attn = torch.einsum('bhdn,bhdm->bhnm', Q, K) * self.scale  # [B, num_heads, HW, HW]
@@ -239,7 +251,7 @@ class AttentionFusion(nn.Module):
         out = torch.einsum('bhnm,bhdm->bhdn', attn, V)  # [B, num_heads, head_dim, HW]
 
         # Reshape back
-        out = out.reshape(B, K, H, W)
+        out = out.reshape(B, num_clusters, height, width)
 
         # Output projection
         out = self.out_proj(out)

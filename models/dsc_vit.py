@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from typing import Optional, List, Tuple
 
 from .vit_encoder import ViTEncoder, SimpleConvEncoder
-from .soft_kmeans import SoftKMeansLayer
+from .soft_kmeans import SoftKMeansLayer, HardKMeansLayer
 from .projections import ProjectionLayers, GatedFusion, AttentionFusion
 
 
@@ -49,6 +49,7 @@ class DSCViT(nn.Module):
                  # Clustering specs
                  num_clusters: Optional[int] = None,  # If None, use num_classes
                  cluster_temperature: float = 1.0,
+                 clustering_method: str = 'soft',    # 'soft' or 'hard'
 
                  # Architecture specs
                  latent_dim: int = 512,
@@ -70,7 +71,8 @@ class DSCViT(nn.Module):
             num_classes: Number of segmentation classes
             img_size: Input image size
             num_clusters: Number of clusters (K). If None, K = num_classes
-            cluster_temperature: Temperature for soft K-Means
+            cluster_temperature: Temperature for soft K-Means (ignored for hard)
+            clustering_method: 'soft' (gradient-based) or 'hard' (EM-based)
             latent_dim: ViT latent dimension (D)
             vit_model_name: Pre-trained ViT model name
             use_pretrained_vit: Whether to use pretrained weights
@@ -90,6 +92,7 @@ class DSCViT(nn.Module):
         self.T = num_recursive_steps     # TRM's T
         self.img_size = img_size
         self.fusion_method = fusion_method
+        self.clustering_method = clustering_method
         self.use_deep_supervision = use_deep_supervision
 
         print(f"Initializing DSC-ViT (TRM-style):")
@@ -101,6 +104,7 @@ class DSCViT(nn.Module):
         print(f"  Recursive steps (T): {self.T}")
         print(f"  Effective depth (per step): {self.T * (self.n + 1) * 2} layers")
         print(f"  Fusion method: {fusion_method}")
+        print(f"  Clustering method: {clustering_method}")
 
         # 1. Encoder (ViT or simple conv)
         if use_simple_encoder:
@@ -127,13 +131,23 @@ class DSCViT(nn.Module):
             latent_dim=latent_dim
         )
 
-        # 3. Soft K-Means clustering
-        self.soft_kmeans = SoftKMeansLayer(
-            num_clusters=self.K,
-            feature_dim=self.K,  # Clustering happens in K-dimensional space
-            temperature=cluster_temperature,
-            init_method='orthogonal'
-        )
+        # 3. K-Means clustering (Soft or Hard)
+        if clustering_method == 'soft':
+            self.clustering_layer = SoftKMeansLayer(
+                num_clusters=self.K,
+                feature_dim=self.K,  # Clustering happens in K-dimensional space
+                temperature=cluster_temperature,
+                init_method='orthogonal'
+            )
+        elif clustering_method == 'hard':
+            self.clustering_layer = HardKMeansLayer(
+                num_clusters=self.K,
+                feature_dim=self.K,  # Clustering happens in K-dimensional space
+                init_method='orthogonal',
+                update_centers=True  # Use traditional K-Means updates
+            )
+        else:
+            raise ValueError(f"Unknown clustering method: {clustering_method}")
 
         # 4. Fusion mechanism for combining cluster features
         if fusion_method == 'gated':
@@ -160,7 +174,17 @@ class DSCViT(nn.Module):
             nn.Conv2d(latent_dim // 2, 1, kernel_size=1)  # Single logit output
         )
 
-        # 7. Upsample layer (to restore original resolution)
+        # 7. Answer network for y update (TRM requirement)
+        # 2-layer network with normalization for stability
+        self.answer_network = nn.Sequential(
+            nn.Conv2d(latent_dim, latent_dim, kernel_size=1),
+            nn.GroupNorm(32, latent_dim),  # Normalization for stability
+            nn.ReLU(inplace=True),
+            nn.Conv2d(latent_dim, latent_dim, kernel_size=1),
+            nn.GroupNorm(32, latent_dim)   # Normalization for stability
+        )
+
+        # 8. Upsample layer (to restore original resolution)
         # Compute output size after encoder
         self.encoder_output_size = img_size // self.patch_size
         self.upsample_factor = self.patch_size
@@ -189,30 +213,21 @@ class DSCViT(nn.Module):
             z: [B, D, H', W'] - current reasoning latent
         Returns:
             z_new: [B, D, H', W'] - updated reasoning latent
-            combined_cluster: [B, K, H', W'] - combined cluster features
+            z_clustered: [B, K, H', W'] - clustered features (for visualization/loss)
         """
-        # Combine y and z for context (no ViT here!)
-        combined_input = y + z  # [B, D, H', W']
+        # Step 1: Cluster z only (design philosophy)
+        z_cluster = self.projections.latent_to_cluster(z)  # D→K
 
-        # Project to cluster space (lightweight operation)
-        z_cluster = self.projections.latent_to_cluster(combined_input)  # D→K
+        # Step 2: Soft K-Means clustering (learnable)
+        z_clustered, _, _ = self.clustering_layer(z_cluster)  # [B, K, H', W']
 
-        # Soft K-Means clustering (learnable)
-        z_clustered, _, _ = self.soft_kmeans(z_cluster)  # [B, K, H', W']
+        # Step 3: Project back to latent space
+        z_latent = self.projections.cluster_to_latent(z_clustered)  # K→D
 
-        # Combine with input image (in cluster space)
-        if self.fusion is None:  # Residual
-            combined_cluster = z_clustered + image_cluster
-        else:  # Gated or Attention fusion
-            combined_cluster = self.fusion(z_clustered, image_cluster)
+        # Step 4: Combine with x_vit and y (TRM philosophy: use x, y, z)
+        z_new = z_latent + x_vit + y
 
-        # Project back to latent space
-        z_new = self.projections.cluster_to_latent(combined_cluster)  # K→D
-
-        # ⭐ Add ViT features as residual (leverage pre-trained knowledge)
-        z_new = z_new + x_vit
-
-        return z_new, combined_cluster
+        return z_new, z_clustered
 
     def update_answer_latent(self,
                             y: torch.Tensor,
@@ -226,8 +241,9 @@ class DSCViT(nn.Module):
         Returns:
             y_new: [B, D, H', W'] - updated answer latent
         """
-        # Refine answer using reasoning
-        y_new = y + z  # Simple residual (can be made more complex)
+        # TRM: y = net(y, z) using network (not simple addition)
+        combined = y + z  # Combine y and z
+        y_new = self.answer_network(combined)  # Pass through network
 
         return y_new
 
@@ -243,6 +259,10 @@ class DSCViT(nn.Module):
         - Update z n times: z = net(x_vit, image_cluster, y, z)
         - Update y once: y = net(y, z)
 
+        TRM gradient strategy:
+        - n-1 iterations: detach z (no gradient)
+        - n-th iteration: keep gradient
+
         Args:
             x_vit: [B, D, H', W'] - ViT features (cached)
             image_cluster: [B, K, H', W'] - image in cluster space (cached)
@@ -257,6 +277,7 @@ class DSCViT(nn.Module):
         combined_cluster = None
         for i in range(self.n):
             z, combined_cluster = self.update_reasoning_latent(x_vit, image_cluster, y, z)
+            # TRM: Full gradient through all n steps (no detach!)
 
         # Update answer latent y once
         y = self.update_answer_latent(y, z)
@@ -401,11 +422,12 @@ class DSCViT(nn.Module):
 
     def get_cluster_centers(self) -> torch.Tensor:
         """Return learned cluster centers."""
-        return self.soft_kmeans.get_cluster_centers()
+        return self.clustering_layer.get_cluster_centers()
 
     def update_temperature(self, new_temp: float):
-        """Update clustering temperature (for annealing)."""
-        self.soft_kmeans.update_temperature(new_temp)
+        """Update clustering temperature (for annealing). Only for soft k-means."""
+        if self.clustering_method == 'soft' and hasattr(self.clustering_layer, 'update_temperature'):
+            self.clustering_layer.update_temperature(new_temp)
 
 
 if __name__ == "__main__":

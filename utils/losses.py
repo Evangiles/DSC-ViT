@@ -13,24 +13,81 @@ import torch.nn.functional as F
 from typing import List, Optional
 
 
-class SegmentationLoss(nn.Module):
+class BCELoss(nn.Module):
     """
-    Standard cross-entropy loss for segmentation with optional class weighting.
+    Binary Cross Entropy Loss for multi-label segmentation.
+
+    Treats each class as an independent binary classification problem.
+    Useful when pixels can belong to multiple classes.
+    """
+
+    def __init__(self, ignore_index: int = -100, pos_weight: Optional[torch.Tensor] = None):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.pos_weight = pos_weight
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred: [B, num_classes, H, W] - logits (before sigmoid)
+            target: [B, H, W] - class indices
+        Returns:
+            loss: scalar
+        """
+        B, C, H, W = pred.shape
+
+        # Convert target to one-hot encoding
+        # Handle ignore_index by clamping first
+        target_clamped = target.clamp(0, C - 1)
+        target_one_hot = F.one_hot(target_clamped, num_classes=C)  # [B, H, W, C]
+        target_one_hot = target_one_hot.permute(0, 3, 1, 2).float()  # [B, C, H, W]
+
+        # Apply sigmoid to predictions
+        pred_sigmoid = torch.sigmoid(pred)
+
+        # Binary cross entropy
+        if self.pos_weight is not None:
+            bce = F.binary_cross_entropy_with_logits(
+                pred, target_one_hot,
+                pos_weight=self.pos_weight,
+                reduction='none'
+            )
+        else:
+            bce = F.binary_cross_entropy(
+                pred_sigmoid, target_one_hot,
+                reduction='none'
+            )  # [B, C, H, W]
+
+        # Mask out ignore_index
+        valid_mask = (target != self.ignore_index).unsqueeze(1)  # [B, 1, H, W]
+        bce = bce * valid_mask.float()
+
+        # Average over valid pixels
+        if valid_mask.sum() > 0:
+            loss = bce.sum() / valid_mask.sum()
+        else:
+            loss = torch.tensor(0.0, device=pred.device)
+
+        return loss
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for addressing class imbalance.
+
+    FL(p_t) = -α(1-p_t)^γ * log(p_t)
+
+    where p_t is the model's estimated probability for the correct class.
     """
 
     def __init__(self,
-                 num_classes: int,
-                 ignore_index: int = -100,
-                 class_weights: Optional[torch.Tensor] = None):
+                 alpha: float = 0.25,
+                 gamma: float = 2.0,
+                 ignore_index: int = -100):
         super().__init__()
-
-        self.num_classes = num_classes
+        self.alpha = alpha
+        self.gamma = gamma
         self.ignore_index = ignore_index
-
-        self.ce_loss = nn.CrossEntropyLoss(
-            weight=class_weights,
-            ignore_index=ignore_index
-        )
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
@@ -40,7 +97,108 @@ class SegmentationLoss(nn.Module):
         Returns:
             loss: scalar
         """
-        return self.ce_loss(pred, target)
+        # Compute cross entropy
+        ce_loss = F.cross_entropy(
+            pred, target,
+            reduction='none',
+            ignore_index=self.ignore_index
+        )  # [B, H, W]
+
+        # Get probabilities
+        p = F.softmax(pred, dim=1)  # [B, C, H, W]
+
+        # Get probability of correct class
+        B, C, H, W = pred.shape
+        target_one_hot = F.one_hot(
+            target.clamp(0, C-1),  # Clamp to avoid -100
+            num_classes=C
+        ).permute(0, 3, 1, 2).float()  # [B, C, H, W]
+
+        p_t = (p * target_one_hot).sum(dim=1)  # [B, H, W]
+
+        # Compute focal weight
+        focal_weight = self.alpha * (1 - p_t) ** self.gamma
+
+        # Apply focal weight
+        focal_loss = focal_weight * ce_loss
+
+        # Mask out ignore_index
+        valid_mask = (target != self.ignore_index)
+        if valid_mask.sum() > 0:
+            focal_loss = focal_loss[valid_mask].mean()
+        else:
+            focal_loss = torch.tensor(0.0, device=pred.device)
+
+        return focal_loss
+
+
+class SegmentationLoss(nn.Module):
+    """
+    Segmentation loss with support for CE, Focal Loss, and BCE.
+    """
+
+    def __init__(self,
+                 num_classes: int,
+                 ignore_index: int = -100,
+                 class_weights: Optional[torch.Tensor] = None,
+                 use_focal: bool = False,
+                 focal_alpha: float = 0.25,
+                 focal_gamma: float = 2.0,
+                 use_bce: bool = False,
+                 bce_weight: float = 0.5):
+        super().__init__()
+
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+        self.use_focal = use_focal
+        self.use_bce = use_bce
+        self.bce_weight = bce_weight
+
+        # Primary loss
+        if use_focal:
+            self.primary_loss = FocalLoss(
+                alpha=focal_alpha,
+                gamma=focal_gamma,
+                ignore_index=ignore_index
+            )
+        else:
+            self.primary_loss = nn.CrossEntropyLoss(
+                weight=class_weights,
+                ignore_index=ignore_index
+            )
+
+        # Optional BCE loss
+        if use_bce:
+            self.bce_loss = BCELoss(ignore_index=ignore_index)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, return_dict: bool = False):
+        """
+        Args:
+            pred: [B, num_classes, H, W]
+            target: [B, H, W] - class indices
+            return_dict: If True, return (loss, dict) with breakdown
+        Returns:
+            loss: scalar (or tuple if return_dict=True)
+        """
+        # Primary loss (CE or Focal)
+        primary = self.primary_loss(pred, target)
+        loss = primary
+
+        # Add BCE if enabled
+        bce_val = 0.0
+        if self.use_bce:
+            bce = self.bce_loss(pred, target)
+            bce_val = bce.item()
+            loss = loss + self.bce_weight * bce
+
+        if return_dict:
+            loss_dict = {
+                'primary': primary.item(),  # Focal or CE
+                'bce': bce_val
+            }
+            return loss, loss_dict
+
+        return loss
 
 
 class ClusterSpaceLoss(nn.Module):
@@ -215,13 +373,25 @@ class DeepSupervisionLoss(nn.Module):
                  lambda_aux: float = 0.4,
                  use_cluster_loss: bool = True,
                  cluster_loss_alpha: float = 0.1,
-                 cluster_loss_beta: float = 0.05):
+                 cluster_loss_beta: float = 0.05,
+                 use_focal_loss: bool = False,
+                 focal_alpha: float = 0.25,
+                 focal_gamma: float = 2.0,
+                 use_bce: bool = False,
+                 bce_weight: float = 0.5):
         super().__init__()
 
         self.lambda_aux = lambda_aux
 
         # Main segmentation loss
-        self.seg_loss = SegmentationLoss(num_classes)
+        self.seg_loss = SegmentationLoss(
+            num_classes,
+            use_focal=use_focal_loss,
+            focal_alpha=focal_alpha,
+            focal_gamma=focal_gamma,
+            use_bce=use_bce,
+            bce_weight=bce_weight
+        )
 
         # Cluster space loss
         self.use_cluster_loss = use_cluster_loss
@@ -280,10 +450,15 @@ class DeepSupervisionLoss(nn.Module):
         if self.use_cluster_loss:
             total_loss = total_loss + L_cluster
 
+        # Get detailed breakdown for main loss
+        _, main_detail = self.seg_loss(seg_preds[-1], target, return_dict=True)
+
         # Loss dict
         loss_dict = {
             'total': total_loss.item(),
             'main': L_main.item(),
+            'main_primary': main_detail['primary'],  # Focal or CE value
+            'main_bce': main_detail['bce'],           # BCE value
             'aux': L_aux.item(),
             'cluster': L_cluster.item() if self.use_cluster_loss else 0.0,
         }
