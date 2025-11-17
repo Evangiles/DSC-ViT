@@ -456,6 +456,7 @@ class DeepSupervisionLoss(nn.Module):
                  use_cluster_loss: bool = True,
                  cluster_loss_alpha: float = 0.1,
                  cluster_loss_beta: float = 0.05,
+                 use_assignment_loss: bool = False,  # ⭐ Default False (unsupervised)
                  use_focal_loss: bool = False,
                  focal_alpha: float = 0.25,
                  focal_gamma: float = 2.0,
@@ -488,7 +489,10 @@ class DeepSupervisionLoss(nn.Module):
                 num_clusters=num_clusters,
                 num_classes=num_classes,
                 alpha=cluster_loss_alpha,
-                beta=cluster_loss_beta
+                beta=cluster_loss_beta,
+                use_assignment_loss=use_assignment_loss,  # ⭐ Passed from config
+                use_compactness_loss=True,
+                use_separation_loss=True
             )
 
     def forward(self,

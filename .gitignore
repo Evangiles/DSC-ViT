@@ -23,7 +23,8 @@ env/
 
 # Data and experiments
 data/*
-!data/*.py  # Keep Python data loaders
+!data/*.py  # Keep Python data loaders (must be after data/*)
+!data/__init__.py
 experiments/
 *.log
 

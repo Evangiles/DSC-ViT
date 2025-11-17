@@ -2,6 +2,7 @@ from .dsc_vit import DSCViT
 from .vit_encoder import ViTEncoder, SimpleConvEncoder
 from .soft_kmeans import SoftKMeansLayer, HardKMeansLayer, MultiScaleSoftKMeans
 from .projections import ProjectionLayers, GatedFusion, AttentionFusion
+from .spatial_context import ASPP, ASPPAdaptive, SimpleSpatialContext
 
 __all__ = [
     'DSCViT',
@@ -13,4 +14,7 @@ __all__ = [
     'ProjectionLayers',
     'GatedFusion',
     'AttentionFusion',
+    'ASPP',
+    'ASPPAdaptive',
+    'SimpleSpatialContext',
 ]

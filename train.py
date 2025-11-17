@@ -10,12 +10,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import argparse
 import yaml
 import os
 from pathlib import Path
 import numpy as np
+from sklearn.decomposition import PCA
 
 # Use non-interactive backend for matplotlib (no GUI windows)
 import matplotlib
@@ -56,6 +58,8 @@ class Trainer:
             num_latent_updates=config['model']['num_latent_updates'],
             num_recursive_steps=config['model']['num_recursive_steps'],
             fusion_method=config['model']['fusion_method'],
+            use_spatial_context=config['model'].get('use_spatial_context', False),
+            spatial_context_type=config['model'].get('spatial_context_type', 'simple'),
             freeze_vit=config['model']['freeze_vit'],
             use_deep_supervision=True
         ).to(self.device)
@@ -68,6 +72,7 @@ class Trainer:
             use_cluster_loss=config['loss']['use_cluster_loss'],
             cluster_loss_alpha=config['loss']['cluster_loss_alpha'],
             cluster_loss_beta=config['loss']['cluster_loss_beta'],
+            use_assignment_loss=config['loss'].get('use_assignment_loss', False),  # ⭐ Unsupervised
             use_focal_loss=config['loss'].get('use_focal_loss', False),
             focal_alpha=config['loss'].get('focal_alpha', 0.25),
             focal_gamma=config['loss'].get('focal_gamma', 2.0),
@@ -114,6 +119,10 @@ class Trainer:
             self.ema_decay = config['training']['ema_decay']
             self.ema_model = self._create_ema_model()
 
+        # Mixed Precision Training (AMP)
+        self.use_amp = config['training'].get('use_amp', True)  # Default: enabled
+        self.scaler = GradScaler() if self.use_amp else None
+
         # Experiment directory
         self.exp_dir = Path(config['training']['exp_dir'])
         self.exp_dir.mkdir(parents=True, exist_ok=True)
@@ -125,6 +134,7 @@ class Trainer:
         print(f"Experiment directory: {self.exp_dir}")
         print(f"Device: {self.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters())/1e6:.2f}M")
+        print(f"Mixed Precision (AMP): {'Enabled' if self.use_amp else 'Disabled'}")
 
     def _create_ema_model(self):
         """Create EMA model."""
@@ -141,6 +151,8 @@ class Trainer:
             num_latent_updates=self.config['model']['num_latent_updates'],
             num_recursive_steps=self.config['model']['num_recursive_steps'],
             fusion_method=self.config['model']['fusion_method'],
+            use_spatial_context=self.config['model'].get('use_spatial_context', False),
+            spatial_context_type=self.config['model'].get('spatial_context_type', 'simple'),
             freeze_vit=False,
             use_deep_supervision=True
         ).to(self.device)
@@ -213,65 +225,85 @@ class Trainer:
             # Deep Supervision Loop: process same batch N_sup times
             for step in range(N_sup):
 
-                # TRM-style forward: deep_recursion with gradient strategy
-                (y, z), seg_pred, q_logit, combined_cluster, image_cluster = self.model(
-                    images, y, z
-                )
-
-                # Compute loss for this supervision step
-                cluster_centers = self.model.get_cluster_centers()
-
-                # Main segmentation loss (with detailed breakdown)
-                loss, loss_detail = self.criterion.seg_loss(seg_pred, targets, return_dict=True)
-                loss_dict_total['main'] += loss.item()
-                loss_dict_total['main_primary'] += loss_detail['primary']
-                loss_dict_total['main_dice'] += loss_detail['dice']
-                loss_dict_total['main_boundary'] += loss_detail['boundary']
-                # Note: aux is not computed in this training loop structure (using N_sup instead of T-step collection)
-
-                # Cluster space loss (if enabled)
-                if self.criterion.use_cluster_loss:
-                    # Use pre-computed downsampled target (cached)
-                    cluster_loss, _ = self.criterion.cluster_loss(
-                        combined_cluster,
-                        target_small,
-                        cluster_centers
+                # Mixed Precision: autocast for forward pass
+                with autocast(enabled=self.use_amp):
+                    # TRM-style forward: deep_recursion with gradient strategy
+                    (y, z), seg_pred, q_logit, combined_cluster, image_cluster = self.model(
+                        images, y, z
                     )
-                    loss = loss + cluster_loss
-                    loss_dict_total['cluster'] += cluster_loss.item()
 
-                # ACT training loss (TRM paper: train q_head to predict correctness)
-                if self.config['training'].get('use_act', False):
-                    # Compute target: 1 if prediction matches ground truth, 0 otherwise
-                    with torch.no_grad():
-                        y_pred_classes = torch.argmax(seg_pred, dim=1)  # [B, H, W]
-                        # Per-pixel correctness, then average to get confidence score
-                        target_halt = (y_pred_classes == targets).float().mean(dim=[1, 2], keepdim=True)  # [B, 1, 1]
+                    # Compute loss for this supervision step
+                    cluster_centers = self.model.get_cluster_centers()
 
-                    # q_logit: [B, 1, H, W] - spatial halt prediction
-                    # Expand target to match q_logit shape
-                    target_halt_expanded = target_halt.unsqueeze(-1).expand_as(q_logit)  # [B, 1, H, W]
+                    # Main segmentation loss (with detailed breakdown)
+                    loss, loss_detail = self.criterion.seg_loss(seg_pred, targets, return_dict=True)
+                    loss_dict_total['main'] += loss.item()
+                    loss_dict_total['main_primary'] += loss_detail['primary']
+                    loss_dict_total['main_dice'] += loss_detail['dice']
+                    loss_dict_total['main_boundary'] += loss_detail['boundary']
+                    # Note: aux is not computed in this training loop structure (using N_sup instead of T-step collection)
 
-                    # Binary cross-entropy: train q_head to predict correctness
-                    act_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-                        q_logit, target_halt_expanded
-                    )
-                    loss = loss + act_loss
-                    loss_dict_total['main'] += act_loss.item()
+                    # Cluster space loss (if enabled)
+                    if self.criterion.use_cluster_loss:
+                        # Use pre-computed downsampled target (cached)
+                        cluster_loss, _ = self.criterion.cluster_loss(
+                            combined_cluster,
+                            target_small,
+                            cluster_centers
+                        )
+                        loss = loss + cluster_loss
+                        loss_dict_total['cluster'] += cluster_loss.item()
+
+                    # ACT training loss (TRM paper: train q_head to predict correctness)
+                    if self.config['training'].get('use_act', False):
+                        # Compute target: 1 if prediction matches ground truth, 0 otherwise
+                        with torch.no_grad():
+                            y_pred_classes = torch.argmax(seg_pred, dim=1)  # [B, H, W]
+                            # Per-pixel correctness, then average to get confidence score
+                            target_halt = (y_pred_classes == targets).float().mean(dim=[1, 2], keepdim=True)  # [B, 1, 1]
+
+                        # q_logit: [B, 1, H, W] - spatial halt prediction
+                        # Expand target to match q_logit shape
+                        target_halt_expanded = target_halt.unsqueeze(-1).expand_as(q_logit)  # [B, 1, H, W]
+
+                        # Binary cross-entropy: train q_head to predict correctness
+                        act_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                            q_logit, target_halt_expanded
+                        )
+                        loss = loss + act_loss
+                        loss_dict_total['main'] += act_loss.item()
 
                 # Backward pass (for this supervision step only)
                 self.optimizer.zero_grad()
-                loss.backward()
 
-                # Gradient clipping
-                if self.config['training'].get('grad_clip', 0) > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.config['training']['grad_clip']
-                    )
+                if self.use_amp:
+                    # AMP: scale loss and backward
+                    self.scaler.scale(loss).backward()
 
-                # Optimizer step (for this supervision step only)
-                self.optimizer.step()
+                    # Gradient clipping (unscale first for AMP)
+                    if self.config['training'].get('grad_clip', 0) > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.config['training']['grad_clip']
+                        )
+
+                    # Optimizer step with scaler
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    # Standard backward
+                    loss.backward()
+
+                    # Gradient clipping
+                    if self.config['training'].get('grad_clip', 0) > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.config['training']['grad_clip']
+                        )
+
+                    # Optimizer step
+                    self.optimizer.step()
 
                 # Update EMA
                 self._update_ema()
@@ -327,16 +359,18 @@ class Trainer:
             # Initialize y and z as None
             y, z = None, None
 
-            # Run all N_sup steps (no early stopping in validation)
-            for step in range(N_sup):
-                (y, z), seg_pred, q_logit, combined_cluster, image_cluster = model(
-                    images, y, z
-                )
+            # Mixed Precision: autocast for forward pass
+            with autocast(enabled=self.use_amp):
+                # Run all N_sup steps (no early stopping in validation)
+                for step in range(N_sup):
+                    (y, z), seg_pred, q_logit, combined_cluster, image_cluster = model(
+                        images, y, z
+                    )
 
-            # Use final prediction
-            # Compute loss
-            loss = self.criterion.seg_loss(seg_pred, targets)
-            total_loss += loss.item()
+                # Use final prediction
+                # Compute loss
+                loss = self.criterion.seg_loss(seg_pred, targets)
+                total_loss += loss.item()
 
             # Update metrics
             self.metrics.update(seg_pred, targets)
@@ -536,6 +570,33 @@ class Trainer:
         if num_samples == 1:
             axes = axes.reshape(1, -1)
 
+        # Get cluster centers and compute PCA-based RGB mapping
+        num_classes = self.config['model']['num_classes']
+        K = model.K
+
+        # Choose colormap based on number of classes
+        if num_classes <= 20:
+            seg_cmap = 'tab20'
+        else:
+            seg_cmap = 'nipy_spectral'
+
+        # For clusters: use PCA if K > 50
+        cluster_rgb_map = None
+        if K > 50:
+            # Get cluster centers [K, K]
+            cluster_centers = model.get_cluster_centers().cpu().numpy()
+
+            # PCA to 3D
+            pca = PCA(n_components=3)
+            cluster_centers_3d = pca.fit_transform(cluster_centers)  # [K, 3]
+
+            # Normalize to [0, 1] for RGB
+            cluster_rgb_map = (cluster_centers_3d - cluster_centers_3d.min()) / \
+                             (cluster_centers_3d.max() - cluster_centers_3d.min() + 1e-8)
+
+            print(f"[PCA Visualization] K={K} clusters, explained variance: "
+                  f"{pca.explained_variance_ratio_.sum():.2%}")
+
         for i in range(num_samples):
             # Original image
             img = images_cpu[i].permute(1, 2, 0).numpy()
@@ -547,22 +608,37 @@ class Trainer:
             # Ground truth
             gt = targets_cpu[i].numpy()
             gt_vis = np.ma.masked_where(gt == -100, gt)  # Mask ignore index
-            axes[i, 1].imshow(gt_vis, cmap='tab20', vmin=0, vmax=20)
+            axes[i, 1].imshow(gt_vis, cmap=seg_cmap, vmin=0, vmax=num_classes-1)
             axes[i, 1].set_title('Ground Truth')
             axes[i, 1].axis('off')
 
             # Prediction
             pred = seg_pred_cpu[i].numpy()
-            axes[i, 2].imshow(pred, cmap='tab20', vmin=0, vmax=20)
+            axes[i, 2].imshow(pred, cmap=seg_cmap, vmin=0, vmax=num_classes-1)
             axes[i, 2].set_title('Prediction')
             axes[i, 2].axis('off')
 
             # Cluster evolution across T steps
             for t_idx, cluster_t in enumerate(cluster_evolution_cpu):
-                cluster_map = cluster_t[i].numpy()
-                axes[i, 3 + t_idx].imshow(cluster_map, cmap='nipy_spectral',
-                                         vmin=0, vmax=model.K-1)
-                axes[i, 3 + t_idx].set_title(f'Cluster T={t_idx+1}')
+                cluster_map = cluster_t[i].numpy()  # [H, W] with values 0~K-1
+
+                if cluster_rgb_map is not None:
+                    # PCA-based RGB visualization
+                    H, W = cluster_map.shape
+                    cluster_rgb_img = np.zeros((H, W, 3))
+
+                    for k in range(K):
+                        mask = (cluster_map == k)
+                        cluster_rgb_img[mask] = cluster_rgb_map[k]
+
+                    axes[i, 3 + t_idx].imshow(cluster_rgb_img)
+                    axes[i, 3 + t_idx].set_title(f'Cluster T={t_idx+1} (PCA)')
+                else:
+                    # Standard colormap for small K
+                    axes[i, 3 + t_idx].imshow(cluster_map, cmap='nipy_spectral',
+                                             vmin=0, vmax=K-1)
+                    axes[i, 3 + t_idx].set_title(f'Cluster T={t_idx+1}')
+
                 axes[i, 3 + t_idx].axis('off')
 
         plt.tight_layout()
@@ -589,7 +665,12 @@ def main():
 
     # Create datasets
     print("\n" + "="*60)
-    print("Loading Combined VOC + SBD Dataset")
+    dataset_name = config['data'].get('dataset_name', 'voc')
+
+    if dataset_name == 'ade20k':
+        print("Loading ADE20K Dataset")
+    else:
+        print("Loading Combined VOC + SBD Dataset")
     print("="*60)
 
     # Create transforms
@@ -604,11 +685,20 @@ def main():
         )
     )
 
-    # Get combined VOC + SBD dataset
-    train_dataset, val_dataset = get_combined_dataset(
-        transform_train=train_transform,
-        transform_val=val_transform
-    )
+    # Load dataset based on config
+    if dataset_name == 'ade20k':
+        from data import get_ade20k_dataset
+        train_dataset, val_dataset = get_ade20k_dataset(
+            root=config['data'].get('data_root', './data/ADEChallengeData2016'),
+            transform_train=train_transform,
+            transform_val=val_transform
+        )
+    else:
+        # Default: VOC + SBD
+        train_dataset, val_dataset = get_combined_dataset(
+            transform_train=train_transform,
+            transform_val=val_transform
+        )
 
     # Debug mode: use small subset
     if args.debug:

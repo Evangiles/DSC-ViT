@@ -19,6 +19,7 @@ from typing import Optional, List, Tuple
 from .vit_encoder import ViTEncoder, SimpleConvEncoder
 from .soft_kmeans import SoftKMeansLayer, HardKMeansLayer
 from .projections import ProjectionLayers, GatedFusion, AttentionFusion
+from .spatial_context import ASPP, ASPPAdaptive, SimpleSpatialContext
 
 
 class DSCViT(nn.Module):
@@ -61,6 +62,10 @@ class DSCViT(nn.Module):
                  num_latent_updates: int = 6,       # n: z를 업데이트하는 횟수
                  num_recursive_steps: int = 3,      # T: y를 업데이트하는 주기
                  fusion_method: str = 'residual',   # 'residual', 'gated', 'attention'
+
+                 # Spatial context encoding
+                 use_spatial_context: bool = False,  # Enable spatial context encoder
+                 spatial_context_type: str = 'simple',  # 'simple' or 'aspp'
 
                  # Training settings
                  freeze_vit: bool = False,
@@ -149,7 +154,37 @@ class DSCViT(nn.Module):
         else:
             raise ValueError(f"Unknown clustering method: {clustering_method}")
 
-        # 4. Fusion mechanism for combining cluster features
+        # 4. Compute encoder output size (needed for spatial context)
+        self.encoder_output_size = img_size // self.patch_size
+
+        # 5. Spatial Context Encoder (optional)
+        self.use_spatial_context = use_spatial_context
+        if use_spatial_context:
+            if spatial_context_type == 'aspp':
+                self.spatial_context_encoder = ASPP(
+                    in_channels=latent_dim,
+                    out_channels=256,  # ASPP internal channels
+                    dilations=[1, 2, 4, 8]  # Optimized for 16×16
+                )
+            elif spatial_context_type == 'aspp_adaptive':
+                self.spatial_context_encoder = ASPPAdaptive(
+                    in_channels=latent_dim,
+                    out_channels=256,
+                    feature_size=self.encoder_output_size  # Auto-adjust dilations
+                )
+            elif spatial_context_type == 'simple':
+                # dilation=4 for 16×16 (RF=9×9, ~56% of feature map)
+                self.spatial_context_encoder = SimpleSpatialContext(
+                    in_channels=latent_dim,
+                    dilation=4
+                )
+            else:
+                raise ValueError(f"Unknown spatial context type: {spatial_context_type}")
+            print(f"  Spatial Context: {spatial_context_type.upper()} (feature_size={self.encoder_output_size})")
+        else:
+            self.spatial_context_encoder = None
+
+        # 6. Fusion mechanism for combining cluster features
         if fusion_method == 'gated':
             self.fusion = GatedFusion(num_clusters=self.K)
         elif fusion_method == 'attention':
@@ -185,8 +220,7 @@ class DSCViT(nn.Module):
         )
 
         # 8. Upsample layer (to restore original resolution)
-        # Compute output size after encoder
-        self.encoder_output_size = img_size // self.patch_size
+        # encoder_output_size already computed above (line 158)
         self.upsample_factor = self.patch_size
 
         self.upsample = nn.Upsample(
@@ -215,6 +249,10 @@ class DSCViT(nn.Module):
             z_new: [B, D, H', W'] - updated reasoning latent
             z_clustered: [B, K, H', W'] - clustered features (for visualization/loss)
         """
+        # Step 0: (Optional) Spatial context encoding
+        if self.use_spatial_context:
+            z = self.spatial_context_encoder(z)  # D→D with multi-scale context
+
         # Step 1: Cluster z only (design philosophy)
         z_cluster = self.projections.latent_to_cluster(z)  # D→K
 

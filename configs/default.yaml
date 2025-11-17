@@ -5,7 +5,7 @@ model:
   image_channels: 3
   num_classes: 21  # PASCAL VOC (20 objects + 1 background)
   img_size: 256
-  num_clusters: null  # If null, use num_classes
+  num_clusters: null  # If null, use num_classes. Can be different (e.g., 32, 64) for unsupervised
   latent_dim: 512
   vit_model_name: 'vit_base_patch16_224'
   use_pretrained_vit: true
@@ -19,6 +19,7 @@ model:
 loss:
   lambda_aux: 0.4  # Weight for auxiliary deep supervision loss
   use_cluster_loss: true
+  use_assignment_loss: false  # ⭐ False = unsupervised clustering (recommended)
   cluster_loss_alpha: 1.0  # Compactness weight (10x increase for stronger learning)
   cluster_loss_beta: 0.5  # Separation weight (10x increase for better cluster separation)
 
@@ -62,6 +63,7 @@ training:
   grad_clip: 0.5  # Gradient clipping
   use_ema: true  # Exponential moving average (TRM uses this)
   ema_decay: 0.999
+  use_amp: true  # Mixed Precision Training (2-3x speedup, less memory)
   warmup_epochs: 5
   exp_dir: 'experiments/default'
 
