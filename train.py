@@ -56,6 +56,9 @@ class Trainer:
             num_latent_updates=config['model']['num_latent_updates'],
             num_recursive_steps=config['model']['num_recursive_steps'],
             fusion_method=config['model']['fusion_method'],
+            use_spatial_context=config['model'].get('use_spatial_context', False),
+            spatial_context_type=config['model'].get('spatial_context_type', 'simple'),
+            spatial_context_dropout=config['model'].get('spatial_context_dropout', 0.1),
             freeze_vit=config['model']['freeze_vit'],
             use_deep_supervision=True
         ).to(self.device)
@@ -68,6 +71,9 @@ class Trainer:
             use_cluster_loss=config['loss']['use_cluster_loss'],
             cluster_loss_alpha=config['loss']['cluster_loss_alpha'],
             cluster_loss_beta=config['loss']['cluster_loss_beta'],
+            use_assignment_loss=config['loss'].get('use_assignment_loss', True),
+            use_compactness_loss=config['loss'].get('use_compactness_loss', True),
+            use_separation_loss=config['loss'].get('use_separation_loss', True),
             use_focal_loss=config['loss'].get('use_focal_loss', False),
             focal_alpha=config['loss'].get('focal_alpha', 0.25),
             focal_gamma=config['loss'].get('focal_gamma', 2.0),
@@ -75,10 +81,42 @@ class Trainer:
             bce_weight=config['loss'].get('bce_weight', 0.5)
         )
 
-        # Optimizer
+        # Optimizer with parameter groups (different LR for spatial context)
         if config['optimizer']['name'] == 'adamw':
+            # Separate parameters for spatial context (if it exists)
+            spatial_context_lr_scale = config['optimizer'].get('spatial_context_lr_scale', 0.1)
+
+            if hasattr(self.model, 'spatial_context_encoder') and self.model.spatial_context_encoder is not None:
+                # Spatial context parameters
+                spatial_params = list(self.model.spatial_context_encoder.parameters())
+                spatial_param_ids = set(id(p) for p in spatial_params)
+
+                # Other parameters (excluding spatial context)
+                other_params = [p for p in self.model.parameters() if id(p) not in spatial_param_ids]
+
+                # Create parameter groups with different learning rates
+                param_groups = [
+                    {
+                        'params': other_params,
+                        'lr': config['optimizer']['lr'],
+                        'weight_decay': config['optimizer']['weight_decay']
+                    },
+                    {
+                        'params': spatial_params,
+                        'lr': config['optimizer']['lr'] * spatial_context_lr_scale,
+                        'weight_decay': config['optimizer']['weight_decay']
+                    }
+                ]
+
+                print(f"\nOptimizer parameter groups:")
+                print(f"  Main model:     lr={config['optimizer']['lr']:.2e}, params={len(other_params)}")
+                print(f"  Spatial context: lr={config['optimizer']['lr'] * spatial_context_lr_scale:.2e}, params={len(spatial_params)}")
+            else:
+                # No spatial context, use all parameters with same LR
+                param_groups = self.model.parameters()
+
             self.optimizer = optim.AdamW(
-                self.model.parameters(),
+                param_groups,
                 lr=config['optimizer']['lr'],
                 betas=(config['optimizer']['beta1'], config['optimizer']['beta2']),
                 weight_decay=config['optimizer']['weight_decay']
@@ -138,6 +176,9 @@ class Trainer:
             num_latent_updates=self.config['model']['num_latent_updates'],
             num_recursive_steps=self.config['model']['num_recursive_steps'],
             fusion_method=self.config['model']['fusion_method'],
+            use_spatial_context=self.config['model'].get('use_spatial_context', False),
+            spatial_context_type=self.config['model'].get('spatial_context_type', 'simple'),
+            spatial_context_dropout=self.config['model'].get('spatial_context_dropout', 0.1),
             freeze_vit=False,
             use_deep_supervision=True
         ).to(self.device)

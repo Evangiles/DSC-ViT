@@ -19,6 +19,7 @@ from typing import Optional, List, Tuple
 from .vit_encoder import ViTEncoder, SimpleConvEncoder
 from .soft_kmeans import SoftKMeansLayer, HardKMeansLayer
 from .projections import ProjectionLayers, GatedFusion, AttentionFusion
+from .spatial_context import ASPP, ASPPAdaptive, SimpleSpatialContext
 
 
 class DSCViT(nn.Module):
@@ -62,6 +63,11 @@ class DSCViT(nn.Module):
                  num_recursive_steps: int = 3,      # T: y를 업데이트하는 주기
                  fusion_method: str = 'residual',   # 'residual', 'gated', 'attention'
 
+                 # Spatial context encoding (toggleable)
+                 use_spatial_context: bool = False,
+                 spatial_context_type: str = 'simple',  # 'aspp', 'aspp_adaptive', 'simple'
+                 spatial_context_dropout: float = 0.1,  # Dropout for spatial context
+
                  # Training settings
                  freeze_vit: bool = False,
                  use_deep_supervision: bool = True):
@@ -94,6 +100,8 @@ class DSCViT(nn.Module):
         self.fusion_method = fusion_method
         self.clustering_method = clustering_method
         self.use_deep_supervision = use_deep_supervision
+        self.use_spatial_context = use_spatial_context
+        self.spatial_context_type = spatial_context_type
 
         print(f"Initializing DSC-ViT (TRM-style):")
         print(f"  Image channels (C): {self.C}")
@@ -105,6 +113,7 @@ class DSCViT(nn.Module):
         print(f"  Effective depth (per step): {self.T * (self.n + 1) * 2} layers")
         print(f"  Fusion method: {fusion_method}")
         print(f"  Clustering method: {clustering_method}")
+        print(f"  Spatial context: {use_spatial_context} ({spatial_context_type if use_spatial_context else 'N/A'})")
 
         # 1. Encoder (ViT or simple conv)
         if use_simple_encoder:
@@ -156,6 +165,29 @@ class DSCViT(nn.Module):
             self.fusion = AttentionFusion(num_clusters=self.K)
         else:  # residual
             self.fusion = None
+
+        # 4.5. Spatial context encoder (optional, toggleable)
+        self.spatial_context_encoder = None
+        if use_spatial_context:
+            if spatial_context_type == 'aspp':
+                self.spatial_context_encoder = ASPP(
+                    in_channels=latent_dim,
+                    out_channels=256
+                )
+            elif spatial_context_type == 'aspp_adaptive':
+                self.spatial_context_encoder = ASPPAdaptive(
+                    in_channels=latent_dim,
+                    out_channels=256,
+                    feature_size=img_size // self.patch_size  # Will be set dynamically
+                )
+            elif spatial_context_type == 'simple':
+                self.spatial_context_encoder = SimpleSpatialContext(
+                    in_channels=latent_dim,
+                    dilation=4,
+                    dropout=spatial_context_dropout
+                )
+            else:
+                raise ValueError(f"Unknown spatial context type: {spatial_context_type}")
 
         # 5. Segmentation head (simple MLP)
         self.seg_head = nn.Sequential(
@@ -215,6 +247,12 @@ class DSCViT(nn.Module):
             z_new: [B, D, H', W'] - updated reasoning latent
             z_clustered: [B, K, H', W'] - clustered features (for visualization/loss)
         """
+        # Optional: Apply spatial context encoding (if enabled)
+        # ⚠️ WARNING: Applying this inside the recursive loop can degrade performance
+        # Enable only if you understand the trade-offs (see COMPLETE_REGRESSION_ANALYSIS.md)
+        if self.use_spatial_context:
+            z = self.spatial_context_encoder(z)  # [B, D, H', W']
+
         # Step 1: Cluster z only (design philosophy)
         z_cluster = self.projections.latent_to_cluster(z)  # D→K
 

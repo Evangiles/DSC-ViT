@@ -1,0 +1,108 @@
+# ADE20K Configuration for DSC-ViT
+# 150 classes (vs VOC's 21 classes)
+# More challenging scene parsing benchmark
+
+# Model configuration
+model:
+  image_channels: 3
+  num_classes: 150  # ADE20K has 150 categories
+  img_size: 256  # Image size
+  latent_dim: 512
+  num_clusters: 150  # If null, uses num_classes (150)
+  cluster_temperature: 1.0
+  clustering_method: 'soft'  # 'soft' or 'hard'
+
+  # Architecture
+  vit_model_name: 'vit_base_patch16_224'
+  use_pretrained_vit: true
+  use_simple_encoder: false
+
+  # TRM-style recursion
+  num_latent_updates: 6       # n: number of z updates
+  num_recursive_steps: 3      # T: number of recursive cycles
+  fusion_method: 'attention'  # 'residual', 'gated', 'attention'
+
+  # Spatial Context Encoding (improves boundary precision)
+  use_spatial_context: false  # Enable multi-scale context encoding
+  spatial_context_type: 'simple'  # 'simple' (lightweight) or 'aspp' (DeepLab-style)
+
+  # Training
+  freeze_vit: true
+  use_deep_supervision: true
+
+# Loss configuration
+loss:
+  # Main segmentation loss
+  use_focal_loss: true
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+
+  # Binary Cross Entropy (multi-label approach)
+  use_bce: true
+  bce_weight: 1.0
+
+  # Deep supervision
+  lambda_aux: 0.4
+
+  # Cluster loss
+  use_cluster_loss: true
+
+  # Cluster loss components (toggleable)
+  use_assignment_loss: false  # Cluster assignments match class labels (disabled - doesn't match intent)
+  use_compactness_loss: true  # Features close to cluster centers
+  use_separation_loss: true   # Cluster centers far from each other
+  cluster_loss_alpha: 1.0  # Compactness weight
+  cluster_loss_beta: 0.5   # Separation weight
+
+# Optimizer configuration
+optimizer:
+  name: 'adamw'  # ⭐ Changed 'type' to 'name'
+  lr: 5.0e-5  # Lower LR for ADE20K (more classes = harder)
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.1
+
+# Scheduler settings
+scheduler:
+  name: 'cosine'
+  min_lr: 1.0e-6
+  step_size: 30
+  gamma: 0.1
+
+# Training configuration
+training:
+  epochs: 150  # ADE20K needs more epochs
+  batch_size: 32  # Smaller batch due to 150 classes
+  num_workers: 4  # Number of data loading workers
+  num_supervision_steps: 8  # N_sup (Deep Supervision)
+  val_interval: 1  # Validate every N epochs
+  save_interval: 5  # Save checkpoint every N epochs
+  grad_clip: 0.5  # Gradient clipping
+  warmup_epochs: 5  # Warmup epochs
+  exp_dir: 'experiments/ade20k'  # Experiment directory
+
+  # ACT (Adaptive Computational Time)
+  use_act: true
+  act_threshold: 0.0  # TRM paper specification
+
+  # EMA (Exponential Moving Average)
+  use_ema: true
+  ema_decay: 0.999
+
+# Data configuration
+data:
+  dataset_name: 'ade20k'
+  data_root: './data/ADEChallengeData2016'
+
+  # Augmentation (based on TRM paper)
+  augmentation:
+    random_flip: true
+    random_crop: true
+    color_jitter: true
+    dihedral: true  # 8 dihedral transformations
+
+# Cluster temperature annealing (optional)
+cluster_temperature:
+  initial: 2.0  # Start softer for exploration
+  final: 0.1    # End sharper for definitive assignments
+  schedule: 'cosine'  # Smoother annealing (linear → cosine)

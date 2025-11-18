@@ -5,20 +5,30 @@ model:
   image_channels: 3
   num_classes: 21  # PASCAL VOC (20 objects + 1 background)
   img_size: 256
-  num_clusters: null  # If null, use num_classes
-  latent_dim: 512
+  num_clusters: 6  # If null, use num_classes
+  latent_dim: 768
   vit_model_name: 'vit_base_patch16_224'
   use_pretrained_vit: true
   use_simple_encoder: false  # Set to true for faster prototyping
-  num_latent_updates: 6  # n: Number of reasoning latent (z) updates (TRM uses 6)
-  num_recursive_steps: 3  # T: Frequency of answer latent (y) updates (TRM uses 3)
+  num_latent_updates: 4  # n: Number of reasoning latent (z) updates (TRM uses 6)
+  num_recursive_steps: 2  # T: Frequency of answer latent (y) updates (TRM uses 3)
   fusion_method: 'attention'  # Options: 'residual', 'gated', 'attention'
   freeze_vit: true
+
+  # Spatial context encoding (toggleable - from later commits)
+  use_spatial_context: false  # Multi-scale spatial context (ASPP-based, disabled by default)
+  spatial_context_type: 'aspp'  # Options: 'aspp', 'aspp_adaptive', 'simple'
+  spatial_context_dropout: 0.15  # Dropout for spatial context (prevents overfitting)
 
 # Loss settings
 loss:
   lambda_aux: 0.4  # Weight for auxiliary deep supervision loss
   use_cluster_loss: true
+
+  # Cluster loss components (toggleable)
+  use_assignment_loss: false  # Cluster assignments match class labels (disabled by default)
+  use_compactness_loss: true  # Features close to cluster centers
+  use_separation_loss: true   # Cluster centers far from each other
   cluster_loss_alpha: 1.0  # Compactness weight (10x increase for stronger learning)
   cluster_loss_beta: 0.5  # Separation weight (10x increase for better cluster separation)
 
@@ -29,7 +39,7 @@ loss:
 
   # Binary Cross Entropy (multi-label approach)
   use_bce: true
-  bce_weight: 1.0  # Weight for BCE component (combined with Focal/CE)
+  bce_weight: 0.8  # Weight for BCE component (combined with Focal/CE)
 
 # Optimizer settings (TRM paper settings)
 optimizer:
@@ -38,6 +48,7 @@ optimizer:
   beta1: 0.9
   beta2: 0.95
   weight_decay: 0.1
+  spatial_context_lr_scale: 0.1  # Spatial context LR = lr * this scale (prevents overfitting)
 
 # Scheduler settings
 scheduler:
