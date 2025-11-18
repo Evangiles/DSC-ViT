@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from typing import Optional, List, Tuple
 
 from .vit_encoder import ViTEncoder, SimpleConvEncoder
+from .swin_encoder import SwinEncoder, FPNDecoder
 from .soft_kmeans import SoftKMeansLayer, HardKMeansLayer
 from .projections import ProjectionLayers, GatedFusion, AttentionFusion
 from .spatial_context import ASPP, ASPPAdaptive, SimpleSpatialContext
