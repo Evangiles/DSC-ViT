@@ -1,0 +1,102 @@
+# Swin-DSC-ViT configuration for multi-scale feature extraction
+# Combines Swin Transformer + FPN fusion + DSC-ViT recursive clustering
+
+# Model settings
+model:
+  image_channels: 3
+  num_classes: 21  # PASCAL VOC (20 objects + 1 background)
+  img_size: 256
+  num_clusters: null  # If null, use num_classes (21)
+  latent_dim: 768
+
+  # Swin Transformer settings
+  swin_model_name: 'swin_tiny_patch4_window7_224'  # Options: swin_tiny, swin_small, swin_base, swin_large
+  use_pretrained_swin: true  # Use ImageNet pretrained weights
+  freeze_swin: true  # Freeze Swin encoder for faster training
+  extract_stages: [0, 1, 2, 3]  # Extract from all 4 stages (64×64, 32×32, 16×16, 8×8)
+  fusion_resolution: 16  # Target resolution after FPN fusion (16×16 for clustering)
+
+  # Recursive refinement (same as DSC-ViT)
+  num_latent_updates: 4  # n: Number of reasoning latent (z) updates per recursive step
+  num_recursive_steps: 2  # T: Number of recursive cycles (y updates)
+  fusion_method: 'residual'  # Options: 'residual', 'gated', 'attention'
+
+  # Spatial context encoding (currently not integrated with Swin, for future use)
+  use_spatial_context: false  # Multi-scale spatial context (can be added later)
+  spatial_context_type: 'simple'  # Options: 'aspp', 'aspp_adaptive', 'simple'
+  spatial_context_dropout: 0.15  # Dropout for spatial context
+
+# Loss settings
+loss:
+  lambda_aux: 0.4  # Weight for auxiliary deep supervision loss
+  use_cluster_loss: true
+
+  # Cluster loss components (toggleable)
+  use_assignment_loss: false  # Cluster assignments match class labels (disabled by default)
+  use_compactness_loss: true  # Features close to cluster centers
+  use_separation_loss: true   # Cluster centers far from each other
+  cluster_loss_alpha: 1.0  # Compactness weight
+  cluster_loss_beta: 0.5  # Separation weight
+
+  # Focal Loss (addresses class imbalance and hard examples)
+  use_focal_loss: true
+  focal_alpha: 0.25  # Weighting factor
+  focal_gamma: 2.0   # Focusing parameter
+
+  # Binary Cross Entropy (multi-label approach)
+  use_bce: true
+  bce_weight: 0.8  # Weight for BCE component
+
+# Optimizer settings
+optimizer:
+  name: 'adamw'
+  lr: 1.0e-4  # Same as DSC-ViT for fair comparison
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.1
+  spatial_context_lr_scale: 0.1  # Spatial context LR (if enabled)
+
+# Scheduler settings
+scheduler:
+  name: 'cosine'
+  min_lr: 1.0e-6
+  step_size: 30
+  gamma: 0.1
+
+# Training settings
+training:
+  epochs: 100
+  batch_size: 24  # Slightly reduced for multi-scale features (more GPU memory)
+  num_workers: 8
+  num_supervision_steps: 8  # N_sup: Deep supervision steps
+  val_interval: 1  # Validate every N epochs
+  save_interval: 10  # Save checkpoint every N epochs
+  grad_clip: 0.5  # Gradient clipping
+  use_ema: true  # Exponential moving average
+  ema_decay: 0.999
+  warmup_epochs: 5
+  exp_dir: 'experiments/swin'
+
+  # ACT (Adaptive Computational Time) - Early stopping per batch
+  use_act: true
+  act_threshold: 3.0  # Stop if q_logit > threshold (TRM uses 0)
+
+# Data settings
+data:
+  dataset_name: 'voc'  # PASCAL VOC 2012
+  data_root: 'data'
+  train_split: 'train'  # 1,464 images
+  val_split: 'val'  # 1,449 images
+
+  # Augmentation
+  augmentation:
+    random_flip: true
+    random_crop: true
+    color_jitter: true
+    dihedral: true  # 8 dihedral transformations
+
+# Cluster temperature annealing (optional)
+cluster_temperature:
+  initial: 2.0  # Start softer for exploration
+  final: 0.1    # End sharper for definitive assignments
+  schedule: 'cosine'  # Smoother annealing

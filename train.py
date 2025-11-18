@@ -22,7 +22,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from models import DSCViT
+from models import DSCViT, SwinDSCViT
 from utils import DeepSupervisionLoss, SegmentationMetrics
 from data import get_dataset, VOCSegmentationKaggle
 from data.voc_sbd_combined import get_combined_dataset
@@ -31,8 +31,68 @@ from data.transforms import SegmentationTransform, get_train_transforms, get_val
 
 class Trainer:
     """
-    Trainer for DSC-ViT.
+    Trainer for DSC-ViT and Swin-DSC-ViT.
     """
+
+    @staticmethod
+    def _create_model(config, for_ema=False):
+        """
+        Factory method to create the appropriate model (DSCViT or SwinDSCViT).
+
+        Args:
+            config: Configuration dictionary
+            for_ema: If True, don't load pretrained weights
+
+        Returns:
+            Model instance
+        """
+        num_clusters = config['model'].get('num_clusters') or config['model']['num_classes']
+
+        # Check if we should use Swin-DSC-ViT
+        use_swin = 'swin_model_name' in config['model']
+
+        if use_swin:
+            # Create Swin-DSC-ViT
+            model = SwinDSCViT(
+                image_channels=config['model']['image_channels'],
+                num_classes=config['model']['num_classes'],
+                img_size=config['model']['img_size'],
+                num_clusters=num_clusters,
+                cluster_temperature=config.get('cluster_temperature', {}).get('initial', 1.0),
+                latent_dim=config['model']['latent_dim'],
+                swin_model_name=config['model']['swin_model_name'],
+                use_pretrained_swin=config['model']['use_pretrained_swin'] and not for_ema,
+                num_latent_updates=config['model']['num_latent_updates'],
+                num_recursive_steps=config['model']['num_recursive_steps'],
+                fusion_method=config['model']['fusion_method'],
+                freeze_swin=config['model'].get('freeze_swin', False) if not for_ema else False,
+                use_deep_supervision=True,
+                extract_stages=config['model'].get('extract_stages', [0, 1, 2, 3]),
+                fusion_resolution=config['model'].get('fusion_resolution', 16)
+            )
+        else:
+            # Create standard DSC-ViT
+            model = DSCViT(
+                image_channels=config['model']['image_channels'],
+                num_classes=config['model']['num_classes'],
+                img_size=config['model']['img_size'],
+                num_clusters=num_clusters,
+                clustering_method=config['model'].get('clustering_method', 'soft'),
+                latent_dim=config['model']['latent_dim'],
+                vit_model_name=config['model']['vit_model_name'],
+                use_pretrained_vit=config['model']['use_pretrained_vit'] and not for_ema,
+                use_simple_encoder=config['model']['use_simple_encoder'],
+                num_latent_updates=config['model']['num_latent_updates'],
+                num_recursive_steps=config['model']['num_recursive_steps'],
+                fusion_method=config['model']['fusion_method'],
+                use_spatial_context=config['model'].get('use_spatial_context', False),
+                spatial_context_type=config['model'].get('spatial_context_type', 'simple'),
+                spatial_context_dropout=config['model'].get('spatial_context_dropout', 0.1),
+                freeze_vit=config['model']['freeze_vit'] if not for_ema else False,
+                use_deep_supervision=True
+            )
+
+        return model
 
     def __init__(self, config, enable_visualization=False):
         self.config = config
@@ -40,28 +100,10 @@ class Trainer:
         self.enable_visualization = enable_visualization
 
         # Create model
-        # Handle num_clusters (if None, use num_classes)
-        num_clusters = config['model'].get('num_clusters') or config['model']['num_classes']
+        self.model = self._create_model(config, for_ema=False).to(self.device)
 
-        self.model = DSCViT(
-            image_channels=config['model']['image_channels'],
-            num_classes=config['model']['num_classes'],
-            img_size=config['model']['img_size'],
-            num_clusters=num_clusters,
-            clustering_method=config['model'].get('clustering_method', 'soft'),
-            latent_dim=config['model']['latent_dim'],
-            vit_model_name=config['model']['vit_model_name'],
-            use_pretrained_vit=config['model']['use_pretrained_vit'],
-            use_simple_encoder=config['model']['use_simple_encoder'],
-            num_latent_updates=config['model']['num_latent_updates'],
-            num_recursive_steps=config['model']['num_recursive_steps'],
-            fusion_method=config['model']['fusion_method'],
-            use_spatial_context=config['model'].get('use_spatial_context', False),
-            spatial_context_type=config['model'].get('spatial_context_type', 'simple'),
-            spatial_context_dropout=config['model'].get('spatial_context_dropout', 0.1),
-            freeze_vit=config['model']['freeze_vit'],
-            use_deep_supervision=True
-        ).to(self.device)
+        # Get num_clusters from config
+        num_clusters = config['model'].get('num_clusters') or config['model']['num_classes']
 
         # Loss function
         self.criterion = DeepSupervisionLoss(
@@ -163,24 +205,7 @@ class Trainer:
 
     def _create_ema_model(self):
         """Create EMA model."""
-        ema_model = DSCViT(
-            image_channels=self.config['model']['image_channels'],
-            num_classes=self.config['model']['num_classes'],
-            img_size=self.config['model']['img_size'],
-            num_clusters=self.config['model'].get('num_clusters', None),
-            clustering_method=self.config['model'].get('clustering_method', 'soft'),
-            latent_dim=self.config['model']['latent_dim'],
-            vit_model_name=self.config['model']['vit_model_name'],
-            use_pretrained_vit=False,  # Don't load pretrained for EMA
-            use_simple_encoder=self.config['model']['use_simple_encoder'],
-            num_latent_updates=self.config['model']['num_latent_updates'],
-            num_recursive_steps=self.config['model']['num_recursive_steps'],
-            fusion_method=self.config['model']['fusion_method'],
-            use_spatial_context=self.config['model'].get('use_spatial_context', False),
-            spatial_context_type=self.config['model'].get('spatial_context_type', 'simple'),
-            spatial_context_dropout=self.config['model'].get('spatial_context_dropout', 0.1),
-            freeze_vit=False,
-            use_deep_supervision=True
+        ema_model = self._create_model(self.config, for_ema=True
         ).to(self.device)
 
         # Initialize with current model weights

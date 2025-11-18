@@ -4,9 +4,11 @@ from .soft_kmeans import SoftKMeansLayer, HardKMeansLayer, MultiScaleSoftKMeans
 from .projections import ProjectionLayers, GatedFusion, AttentionFusion
 from .spatial_context import ASPP, ASPPAdaptive, SimpleSpatialContext
 from .swin_encoder import SwinEncoder, FPNDecoder
+from .swin_dsc_vit import SwinDSCViT
 
 __all__ = [
     'DSCViT',
+    'SwinDSCViT',
     'ViTEncoder',
     'SimpleConvEncoder',
     'SoftKMeansLayer',
